@@ -12,6 +12,9 @@ from groundingdino.util.slconfig import SLConfig
 from groundingdino.util.utils import clean_state_dict, get_phrases_from_posmap
 from groundingdino.util.vl_utils import create_positive_map_from_span
 
+from cub_dataset import BirdDataset
+from torch.utils.data import DataLoader
+
 
 def plot_boxes_to_image(image_pil, tgt):
     H, W = tgt["size"]
@@ -80,6 +83,39 @@ def load_model(model_config_path, model_checkpoint_path, cpu_only=False):
     return model
 
 
+def eval(model, dataloader, caption, box_threshold, text_threshold=None, with_logits=True, cpu_only=False, token_spans=None):
+    assert text_threshold is not None or token_spans is not None, "text_threshould and token_spans should not be None at the same time!"
+    caption = caption.lower()
+    caption = caption.strip()
+    if not caption.endswith("."):
+        caption = caption + "."
+    device = "cuda" if not cpu_only else "cpu"
+    model = model.to(device)
+
+
+    model.eval()
+    with torch.no_grad():
+        for i, (images, labels) in enumerate(dataloader):
+            images = images.to(device)
+            bs, _, _, _ = images.shape
+            outputs = model(images, captions=[caption] * bs)
+
+            logits = outputs["pred_logits"].sigmoid() # bs, nq, 256
+            boxes = outputs["pred_boxes"] # bs, nq, 4
+
+            print(logits.shape, boxes.shape)
+
+            logits_filt = logits.clone()
+            boxes_filt = boxes.clone()
+
+            logits_max = logits_filt.max(dim=-1).values
+            max_logits, max_logits_indices = torch.max(logits_max, dim=1)
+            boxes_filt = torch.gather(boxes_filt, 1, max_logits_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, 4)).squeeze(dim=1)
+            print(boxes_filt)
+            break
+
+
+
 def get_grounding_output(model, image, caption, box_threshold, text_threshold=None, with_logits=True, cpu_only=False, token_spans=None):
     assert text_threshold is not None or token_spans is not None, "text_threshould and token_spans should not be None at the same time!"
     caption = caption.lower()
@@ -98,18 +134,9 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold=No
     if token_spans is None:
         logits_filt = logits.cpu().clone()
         boxes_filt = boxes.cpu().clone()
-
-        
-        print(logits_filt.shape)
-        print(boxes_filt.shape)
-
         filt_mask = logits_filt.max(dim=1)[0] > box_threshold
-        print(filt_mask.shape)
-
         logits_filt = logits_filt[filt_mask]  # num_filt, 256
         boxes_filt = boxes_filt[filt_mask]  # num_filt, 4
-        print(logits_filt.shape)
-        print(boxes_filt.shape)
 
         # get phrase
         tokenlizer = model.tokenizer
@@ -161,8 +188,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint_path", "-p", type=str, required=True, help="path to checkpoint file"
     )
-    parser.add_argument("--image_path", "-i", type=str, required=True, help="path to image file")
-    parser.add_argument("--text_prompt", "-t", type=str, required=True, help="text prompt")
+    parser.add_argument("--image_path", "-i", type=str, help="path to image file")
+    parser.add_argument("--text_prompt", "-t", type=str,  help="text prompt")
     parser.add_argument(
         "--output_dir", "-o", type=str, default="outputs", required=True, help="output directory"
     )
@@ -191,33 +218,26 @@ if __name__ == "__main__":
 
     # make dir
     os.makedirs(output_dir, exist_ok=True)
-    # load image
-    image_pil, image = load_image(image_path)
+
     # load model
     model = load_model(config_file, checkpoint_path, cpu_only=args.cpu_only)
 
-    # visualize raw image
-    image_pil.save(os.path.join(output_dir, "raw_image.jpg"))
-
-    # set the text_threshold to None if token_spans is set.
-    if token_spans is not None:
-        text_threshold = None
-        print("Using token_spans. Set the text_threshold to None.")
-
+    # make dataloader
+    cub_dataset =  BirdDataset(phase='val', resize=(448,448), dataset_path='/root/autodl-tmp/')
+    cub_dataloader = DataLoader(dataset=cub_dataset, batch_size=8, shuffle=False, num_workers=4, pin_memory=True, drop_last=False)
 
     # run model
-    boxes_filt, pred_phrases = get_grounding_output(
-        model, image, text_prompt, box_threshold, text_threshold, cpu_only=args.cpu_only, token_spans=token_spans
-    )
+    eval(model, cub_dataloader, caption='bird', box_threshold=box_threshold, text_threshold=text_threshold, 
+         cpu_only=args.cpu_only, token_spans=token_spans)
 
-    # visualize pred
-    size = image_pil.size
-    pred_dict = {
-        "boxes": boxes_filt,
-        "size": [size[1], size[0]],  # H,W
-        "labels": pred_phrases,
-    }
-    image_with_box = plot_boxes_to_image(image_pil, pred_dict)[0]
-    save_path = os.path.join(output_dir, "pred.jpg")
-    image_with_box.save(save_path)
-    print(f"\n======================\n{save_path} saved.\nThe program runs successfully!")
+    # # visualize pred
+    # size = image_pil.size
+    # pred_dict = {
+    #     "boxes": boxes_filt,
+    #     "size": [size[1], size[0]],  # H,W
+    #     "labels": pred_phrases,
+    # }
+    # image_with_box = plot_boxes_to_image(image_pil, pred_dict)[0]
+    # save_path = os.path.join(output_dir, "pred.jpg")
+    # image_with_box.save(save_path)
+    # print(f"\n======================\n{save_path} saved.\nThe program runs successfully!")
